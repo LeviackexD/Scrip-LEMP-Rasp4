@@ -1,1 +1,193 @@
 
+#!/bin/bash
+
+# ==============================
+# Script definitivo LEMP + phpMyAdmin + Cloudflare Tunnel
+# Optimizado para Raspberry Pi 4 con disco externo
+# ==============================
+
+DISK_ROOT="/mnt/webdata"
+
+# Función sí/no
+ask_yes_no() {
+    while true; do
+        read -r -p "$1 (s/n): " yn
+        case $yn in
+            [Ss]* ) return 0;;
+            [Nn]* ) return 1;;
+            * ) echo "Por favor, responde s o n.";;
+        esac
+    done
+}
+
+# ==============================
+# Comprobar disco externo
+# ==============================
+if [ ! -d "$DISK_ROOT" ]; then
+    echo "Error: el disco externo no está montado en $DISK_ROOT"
+    exit 1
+fi
+
+# ==============================
+# 1️⃣ Preparación del sistema
+# ==============================
+if ask_yes_no "Actualizar sistema e instalar herramientas básicas?"; then
+    sudo apt update && sudo apt upgrade -y
+    sudo apt install -y git nano unzip curl ufw
+fi
+
+# ==============================
+# 2️⃣ Instalar Nginx
+# ==============================
+if ask_yes_no "Instalar Nginx?"; then
+    sudo apt install -y nginx
+    sudo systemctl enable nginx
+    sudo systemctl start nginx
+fi
+
+# ==============================
+# 3️⃣ Instalar PHP-FPM con optimización
+# ==============================
+if ask_yes_no "Instalar PHP-FPM 8.x y módulos?"; then
+    sudo apt install -y php8.2-fpm php8.2-mysql php8.2-curl php8.2-gd php8.2-mbstring php8.2-xml php8.2-zip
+    sudo systemctl enable php8.2-fpm
+    sudo systemctl start php8.2-fpm
+
+    # Optimización básica PHP-FPM
+    PHP_CONF="/etc/php/8.2/fpm/pool.d/www.conf"
+    sudo sed -i "s/^pm = .*/pm = dynamic/" $PHP_CONF
+    sudo sed -i "s/^pm.max_children = .*/pm.max_children = 10/" $PHP_CONF
+    sudo sed -i "s/^pm.start_servers = .*/pm.start_servers = 2/" $PHP_CONF
+    sudo sed -i "s/^pm.min_spare_servers = .*/pm.min_spare_servers = 1/" $PHP_CONF
+    sudo sed -i "s/^pm.max_spare_servers = .*/pm.max_spare_servers = 5/" $PHP_CONF
+    sudo systemctl restart php8.2-fpm
+fi
+
+# ==============================
+# 4️⃣ Instalar MariaDB con disco externo
+# ==============================
+if ask_yes_no "Instalar MariaDB en disco externo y seguridad inicial?"; then
+    sudo apt install -y mariadb-server
+    sudo systemctl enable mariadb
+    sudo systemctl stop mariadb
+
+    # Crear carpeta datos en disco
+    sudo mkdir -p "$DISK_ROOT/mysql"
+    sudo chown -R mysql:mysql "$DISK_ROOT/mysql"
+    sudo chmod -R 750 "$DISK_ROOT/mysql"
+
+    # Cambiar datadir
+    sudo sed -i "s|^datadir\s*=.*|datadir = $DISK_ROOT/mysql|" /etc/mysql/mariadb.conf.d/50-server.cnf
+
+    # Mover datos si existen
+    sudo rsync -av /var/lib/mysql/ "$DISK_ROOT/mysql/"
+
+    sudo systemctl start mariadb
+
+    # Optimización básica MariaDB
+    MARIADB_CONF="/etc/mysql/mariadb.conf.d/50-server.cnf"
+    sudo sed -i "s/^#innodb_buffer_pool_size.*/innodb_buffer_pool_size = 512M/" $MARIADB_CONF
+    sudo sed -i "s/^#innodb_log_file_size.*/innodb_log_file_size = 64M/" $MARIADB_CONF
+    sudo sed -i "s/^#max_connections.*/max_connections = 100/" $MARIADB_CONF
+    sudo systemctl restart mariadb
+
+    sudo mysql_secure_installation
+fi
+
+# ==============================
+# 5️⃣ Instalar phpMyAdmin
+# ==============================
+if ask_yes_no "Instalar phpMyAdmin?"; then
+    sudo apt install -y phpmyadmin
+    sudo ln -s /usr/share/phpmyadmin "$DISK_ROOT/www/phpmyadmin"
+fi
+
+# ==============================
+# 6️⃣ Configurar hasta 5 webs
+# ==============================
+MAX_WEBS=5
+declare -a WEB_NAMES
+declare -a HTTPS_WEBS
+
+for (( i=1; i<=MAX_WEBS; i++ )); do
+    if ask_yes_no "Configurar la web #$i?"; then
+        read -r -p "Dominio para web #$i (ej: misitio$i.com): " DOMAIN
+        WEB_NAMES+=("$DOMAIN")
+
+        # Crear carpetas y permisos
+        sudo mkdir -p "$DISK_ROOT/www/$DOMAIN/html"
+        sudo mkdir -p "$DISK_ROOT/logs"
+        sudo chown -R pi:www-data "$DISK_ROOT/www/$DOMAIN/html"
+        sudo chmod -R 755 "$DISK_ROOT/www/$DOMAIN"
+
+        # Server block Nginx
+        sudo tee /etc/nginx/sites-available/"$DOMAIN" > /dev/null <<EOL
+server {
+    listen 80;
+    server_name $DOMAIN www.$DOMAIN;
+
+    root $DISK_ROOT/www/$DOMAIN/html;
+    index index.php index.html index.htm;
+
+    access_log $DISK_ROOT/logs/${DOMAIN}_access.log;
+    error_log $DISK_ROOT/logs/${DOMAIN}_error.log;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOL
+
+        sudo ln -s /etc/nginx/sites-available/"$DOMAIN" /etc/nginx/sites-enabled/
+
+        if ask_yes_no "Habilitar HTTPS con Certbot para $DOMAIN?"; then
+            HTTPS_WEBS+=("$DOMAIN")
+        fi
+    fi
+done
+
+sudo nginx -t
+sudo systemctl reload nginx
+
+# ==============================
+# 7️⃣ Seguridad básica
+# ==============================
+if ask_yes_no "Configurar firewall y cambiar contraseña de Pi?"; then
+    sudo ufw allow 'Nginx Full'
+    sudo ufw allow OpenSSH
+    sudo ufw enable
+    passwd
+fi
+
+# ==============================
+# 8️⃣ HTTPS Certbot
+# ==============================
+if [ ${#HTTPS_WEBS[@]} -gt 0 ]; then
+    if ask_yes_no "Instalar Certbot y activar HTTPS?"; then
+        sudo apt install -y certbot python3-certbot-nginx
+        for DOMAIN in "${HTTPS_WEBS[@]}"; do
+            sudo certbot --nginx -d "$DOMAIN" -d www."$DOMAIN"
+        done
+    fi
+fi
+
+# ==============================
+# 9️⃣ Cloudflare Tunnel
+# ==============================
+if ask_yes_no "Configurar Cloudflare Tunnel?"; then
+    curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb -o cloudflared.deb
+    sudo dpkg -i cloudflared.deb
+    rm cloudflared.deb
+fi
+
+echo "=============================="
+echo "¡Todo listo! Tus webs están en $DISK_ROOT/www/"
