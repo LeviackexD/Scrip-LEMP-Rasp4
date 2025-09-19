@@ -1,0 +1,171 @@
+#!/bin/bash
+
+# ==============================
+# Script interactivo LEMP + phpMyAdmin + Cloudflare Tunnel
+# Para Raspberry Pi 4
+# ==============================
+
+# Función para preguntar sí/no
+ask_yes_no() {
+    while true; do
+        read -r -p "$1 (s/n): " yn
+        case $yn in
+            [Ss]* ) return 0;;
+            [Nn]* ) return 1;;
+            * ) echo "Por favor, responde s o n.";;
+        esac
+    done
+}
+
+# ==============================
+# 1️⃣ Preparación del sistema
+# ==============================
+if ask_yes_no "¿Quieres actualizar el sistema e instalar herramientas básicas (git, nano, unzip, curl)?"; then
+    echo "Actualizando sistema..."
+    sudo apt update && sudo apt upgrade -y
+    echo "Instalando herramientas básicas..."
+    sudo apt install -y git nano unzip curl
+fi
+
+# ==============================
+# 2️⃣ Instalación de Nginx
+# ==============================
+if ask_yes_no "¿Quieres instalar Nginx y configurarlo para que arranque automáticamente?"; then
+    echo "Instalando Nginx..."
+    sudo apt install -y nginx
+    sudo systemctl enable nginx
+    sudo systemctl start nginx
+    echo "Nginx instalado y activo."
+fi
+
+# ==============================
+# 3️⃣ Instalación de PHP-FPM
+# ==============================
+if ask_yes_no "¿Quieres instalar PHP-FPM 8.x con módulos necesarios?"; then
+    echo "Instalando PHP-FPM y módulos..."
+    sudo apt install -y php8.2-fpm php8.2-mysql php8.2-curl php8.2-gd php8.2-mbstring php8.2-xml php8.2-zip
+    sudo systemctl enable php8.2-fpm
+    sudo systemctl start php8.2-fpm
+    echo "PHP-FPM instalado y activo."
+fi
+
+# ==============================
+# 4️⃣ Instalación de MariaDB
+# ==============================
+if ask_yes_no "¿Quieres instalar MariaDB y configurar seguridad inicial?"; then
+    echo "Instalando MariaDB..."
+    sudo apt install -y mariadb-server
+    sudo systemctl enable mariadb
+    sudo systemctl start mariadb
+    echo "Configurando seguridad inicial de MariaDB..."
+    sudo mysql_secure_installation
+fi
+
+# ==============================
+# 5️⃣ Instalación de phpMyAdmin
+# ==============================
+if ask_yes_no "¿Quieres instalar phpMyAdmin?"; then
+    echo "Instalando phpMyAdmin..."
+    sudo apt install -y phpmyadmin
+    # Crear enlace simbólico para Nginx
+    sudo ln -s /usr/share/phpmyadmin /var/www/html/phpmyadmin
+    echo "phpMyAdmin instalado y accesible en http://IP_DE_TU_PI/phpmyadmin"
+fi
+
+# ==============================
+# 6️⃣ Configuración de webs (hasta 5)
+# ==============================
+MAX_WEBS=5
+declare -a WEB_NAMES
+declare -a HTTPS_WEBS
+
+echo "Vamos a configurar hasta $MAX_WEBS webs."
+for (( i=1; i<=MAX_WEBS; i++ )); do
+    if ask_yes_no "¿Quieres configurar la web #$i?"; then
+        read -r -p "Introduce el nombre de dominio para la web #$i (ej: misitio$i.com): " DOMAIN
+        WEB_NAMES+=("$DOMAIN")
+
+        # Crear carpetas y permisos
+        sudo mkdir -p /var/www/"$DOMAIN"/html
+        sudo mkdir -p /var/www/logs
+        sudo chown -R pi:www-data /var/www/"$DOMAIN"/html
+        sudo chmod -R 755 /var/www/"$DOMAIN"
+
+        # Crear server block Nginx
+        sudo tee /etc/nginx/sites-available/"$DOMAIN" > /dev/null <<EOL
+server {
+    listen 80;
+    server_name $DOMAIN www.$DOMAIN;
+
+    root /var/www/"$DOMAIN"/html;
+    index index.php index.html index.htm;
+
+    access_log /var/www/logs/${DOMAIN}_access.log;
+    error_log /var/www/logs/${DOMAIN}_error.log;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOL
+
+        sudo ln -s /etc/nginx/sites-available/"$DOMAIN" /etc/nginx/sites-enabled/
+        echo "Web $DOMAIN configurada en Nginx."
+
+        # Preguntar HTTPS
+        if ask_yes_no "¿Quieres habilitar HTTPS con Certbot para $DOMAIN?"; then
+            HTTPS_WEBS+=("$DOMAIN")
+        fi
+    fi
+done
+
+sudo nginx -t
+sudo systemctl reload nginx
+
+# ==============================
+# 7️⃣ Seguridad básica
+# ==============================
+if ask_yes_no "¿Quieres configurar firewall y cambiar la contraseña del usuario Pi?"; then
+    sudo apt install -y ufw
+    sudo ufw allow 'Nginx Full'
+    sudo ufw allow OpenSSH
+    sudo ufw enable
+    echo "Firewall configurado."
+    passwd
+fi
+
+# ==============================
+# 8️⃣ HTTPS automático con Certbot
+# ==============================
+if [ ${#HTTPS_WEBS[@]} -gt 0 ]; then
+    if ask_yes_no "¿Quieres instalar Certbot y activar HTTPS para las webs seleccionadas?"; then
+        sudo apt install -y certbot python3-certbot-nginx
+        for DOMAIN in "${HTTPS_WEBS[@]}"; do
+            sudo certbot --nginx -d "$DOMAIN" -d www."$DOMAIN"
+        done
+    fi
+fi
+
+# ==============================
+# 9️⃣ Cloudflare Tunnel
+# ==============================
+if ask_yes_no "¿Quieres configurar Cloudflare Tunnel para exponer tus webs sin abrir puertos?"; then
+    echo "Instalando Cloudflare Tunnel..."
+    curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64.deb -o cloudflared.deb
+    sudo dpkg -i cloudflared.deb
+    rm cloudflared.deb
+    echo "Cloudflare Tunnel instalado. Deberás seguir las instrucciones de Cloudflare para crear el túnel."
+fi
+
+echo "=============================="
+echo "¡Script completado! Tus webs están configuradas."
+echo "Recuerda subir tus proyectos manualmente a /var/www/TU_DOMINIO/html"
